@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Video Player</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: #4876FF; color: white; border: none; border-radius: 12px; box-shadow: 0 4px 14px rgba(72,118,255,0.4); cursor: pointer; transition: all 0.2s; font-weight: 600; }
+    #start-button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(72,118,255,0.5); }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.7); color: white; padding: 12px 24px; border-radius: 12px; font-size: 16px; font-weight: 500; margin: 0; backdrop-filter: blur(8px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); max-width: 80%; text-align: center; display: none; z-index: 1000; }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.5); color: white; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; backdrop-filter: blur(8px); box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 1000; }
+    .xr-active .exit-ar { display: flex; }
+  </style>
+</head>
+<body>
+  <div id="overlay"><button id="start-button">Start Video Demo</button></div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, controllers = [], xrSession = null, videoPanel;
+    let lastCameraPosition = new THREE.Vector3();
+    let movementThreshold = 0.01;
+    let isMoving = false;
+    let movementTimer = null;
+    
+    // Initialize WebXR components
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0x404040, 2));
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      directionalLight.position.set(1, 1, 1).normalize();
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+      
+      // Create video panel
+      videoPanel = new VideoPanel();
+      
+      // Event listeners
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      document.getElementById('exit-ar').addEventListener('click', endARSession);
+    }
+
+    // Start AR session
+    function startARSession() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar')
+        .then(supported => {
+          if (supported) {
+            navigator.xr.requestSession('immersive-ar', { 
+              requiredFeatures: ['hit-test', 'unbounded'], 
+              optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+              domOverlay: { root: document.body } 
+            })
+            .then(onSessionStarted)
+            .catch(err => {
+              console.error('Session start error:', err);
+              updateStatus('Failed to start AR: ' + err.message + '. Make sure unbounded spaces are enabled in chrome://flags.');
+            });
+          } else {
+            updateStatus('WebXR AR not supported on this device.');
+          }
+        });
+    }
+
+    // Handle AR session start
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('start-button').style.display = 'none';
+      document.body.classList.add('xr-active');
+      updateStatus('Starting unbounded AR session...');
+      
+      // Use unbounded reference space
+      renderer.xr.setReferenceSpaceType('unbounded');
+      
+      // Set session and handle possible errors
+      try {
+        renderer.xr.setSession(session);
+        updateStatus('Unbounded AR session started successfully!');
+      } catch (error) {
+        console.error('Error setting session:', error);
+        updateStatus('Error starting AR session: ' + error.message);
+        return;
+      }
+      
+      // Setup controllers
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        scene.add(controller);
+        return controller;
+      });
+      
+      // Initialize video panel
+      videoPanel.init(scene, camera);
+      
+      // Store initial camera position
+      lastCameraPosition.copy(camera.position);
+      
+      renderer.setAnimationLoop(render);
+      session.addEventListener('end', onSessionEnd);
+      updateStatus('Video player ready! You can now move freely in unbounded space.');
+    }
+    
+    // End AR session
+    function endARSession() {
+      if (xrSession) xrSession.end();
+    }
+    
+    function onSessionEnd() {
+      document.body.classList.remove('xr-active');
+      document.getElementById('start-button').style.display = 'block';
+      document.getElementById('status').style.display = 'none';
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      // Clean up scene
+      while(scene.children.length > 0) { 
+        const object = scene.children[0];
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) {
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+        scene.remove(object); 
+      }
+    }
+    
+    function render() {
+      // Check camera movement
+      const movement = camera.position.distanceTo(lastCameraPosition);
+      
+      if (movement > movementThreshold) {
+        // User is moving
+        isMoving = true;
+        lastCameraPosition.copy(camera.position);
+        
+        // Set higher transparency while moving
+        if (videoPanel && videoPanel.panelMaterial) {
+          videoPanel.panelMaterial.opacity = 0.4; // More transparent when moving
+        }
+        
+        // Reset the movement timer
+        clearTimeout(movementTimer);
+        movementTimer = setTimeout(() => {
+          isMoving = false;
+          // Return to normal transparency when stopped
+          if (videoPanel && videoPanel.panelMaterial) {
+            videoPanel.panelMaterial.opacity = 0.85; // Less transparent when still
+          }
+        }, 500); // Wait 500ms of no movement before considering "stopped"
+      }
+      
+      // Update video panel position relative to camera
+      if (videoPanel) videoPanel.update(camera);
+      
+      renderer.render(scene, camera);
+    }
+    
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      // Auto-hide after 4 seconds for non-error messages
+      if (!message.includes('error') && !message.includes('not supported')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 4000);
+      }
+    }
+    
+    // Video Panel Class
+    class VideoPanel {
+      constructor() {
+        this.panel = null;
+        this.panelGroup = null;
+        this.panelMaterial = null;
+        this.video = null;
+      }
+      
+      init(scene, camera) {
+        this.scene = scene;
+        this.camera = camera;
+        
+        // Create panel group
+        this.panelGroup = new THREE.Group();
+        this.scene.add(this.panelGroup);
+        
+        // Create and setup video element
+        this.createVideoPanel();
+      }
+      
+      createVideoPanel() {
+        // Create video element
+        this.video = document.createElement('video');
+        this.video.src = 'your-video.mp4'; // Replace with your video path
+        this.video.crossOrigin = 'anonymous';
+        this.video.loop = true;
+        this.video.muted = true;
+        this.video.playsInline = true;
+        this.video.autoplay = true;
+        
+        // Create video texture
+        const videoTexture = new THREE.VideoTexture(this.video);
+        videoTexture.minFilter = THREE.LinearFilter;
+        videoTexture.magFilter = THREE.LinearFilter;
+        videoTexture.format = THREE.RGBAFormat;
+        
+        // Create panel with video texture
+        this.panelMaterial = new THREE.MeshBasicMaterial({
+          map: videoTexture,
+          transparent: true,
+          opacity: 0.85, // Default opacity when not moving
+          side: THREE.DoubleSide
+        });
+        
+        // Panel size - 16:9 aspect ratio, large enough to be immersive
+        const panelWidth = 0.8;
+        const panelHeight = panelWidth * (9/16);
+        
+        this.panel = new THREE.Mesh(
+          new THREE.PlaneGeometry(panelWidth, panelHeight),
+          this.panelMaterial
+        );
+        
+        this.panelGroup.add(this.panel);
+        
+        // Force video to play (important for WebXR)
+        this.video.play().catch(e => {
+          console.warn('Video play error:', e);
+          // Try playing on user interaction
+          document.addEventListener('click', () => {
+            this.video.play().catch(e => console.warn('Video play error after click:', e));
+          }, { once: true });
+        });
+      }
+      
+      update(camera) {
+        if (!this.panelGroup || !camera) return;
+        
+        // Position panel in front of camera
+        const cameraDirection = new THREE.Vector3(0, 0, -1);
+        cameraDirection.applyQuaternion(camera.quaternion);
+        cameraDirection.multiplyScalar(0.7); // Distance from camera
+        
+        this.panelGroup.position.copy(camera.position).add(cameraDirection);
+        this.panelGroup.lookAt(camera.position);
+        
+        // Adjust vertical position - slightly below eye level
+        this.panelGroup.position.y = camera.position.y - 0.05;
+      }
+    }
+    
+    // Initialize everything
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
